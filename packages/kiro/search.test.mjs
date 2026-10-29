@@ -1,5 +1,6 @@
 // Anthropic's hosted web search on Kiro: the model's call to web_search is
-// searched with Kiro's own MCP web_search (q.<region>.amazonaws.com/mcp),
+// searched with Kiro's own web_search, through its runtime's InvokeMCP as
+// kiro-cli calls it,
 // the model asked again with what was found, and the caller answered with
 // server_tool_use, web_search_tool_result and the answer, never a tool_use
 // of web_search. Everything runs against a fake Kiro: no network.
@@ -52,7 +53,8 @@ const mcpOK = (results, query = "q") =>
   Response.json({ jsonrpc: "2.0", id: "1", result: { content: [{ type: "text", text: JSON.stringify({ results, totalResults: results.length, query, error: null }) }] } })
 
 // kiro is a fake Kiro: turns answers each generateAssistantResponse in turn,
-// mcp each search. It notes what was sent.
+// mcp each InvokeMCP (known by its x-amz-target, wherever it is sent). It
+// notes what was sent.
 function kiro({ turns, mcp = () => mcpOK([hit(1), hit(2)]), refresh } = {}) {
   const seen = { kiro: [], mcp: [], refreshes: 0 }
   globalThis.fetch = async (url, init = {}) => {
@@ -63,7 +65,7 @@ function kiro({ turns, mcp = () => mcpOK([hit(1), hit(2)]), refresh } = {}) {
       if (!t) throw new Error("Kiro asked more turns than scripted")
       return typeof t === "function" ? t(init) : stream(t)
     }
-    if (u.includes("/mcp")) {
+    if (new Headers(init.headers).get("x-amz-target") === "AmazonCodeWhispererStreamingService.InvokeMCP") {
       seen.mcp.push({ url: u, body: JSON.parse(init.body), headers: new Headers(init.headers) })
       return mcp(init, seen.mcp.length)
     }
@@ -82,6 +84,12 @@ const OAUTH = { type: "oauth", access: "old", refresh: "r1", expires: Date.now()
   profileArn: PROFILE, accountId: "me@example.com" }
 const SEARCH_TYPE_OK = "web_search_20250305"
 const SEARCH = { type: SEARCH_TYPE_OK, name: "web_search", max_uses: 3 }
+// kiro-cli's own web_search (2.35's strings), with the purpose its agent adds
+const CLI_SPEC = { name: "web_search",
+  description: "WebSearch looks up information that is outside the model's training data or cannot be reliably inferred from the current codebase/context.",
+  inputSchema: { json: { type: "object", properties: {
+    query: { type: "string", maxLength: 200, description: "Search query (max 200 chars) - use concise keywords, not full sentences" },
+    __tool_use_purpose: { type: "string", description: "A brief explanation why you are making this tool use." } }, required: ["query"] } } }
 const READ = { name: "Read", description: "read a file", input_schema: { type: "object", properties: { path: { type: "string" } } } }
 
 async function ask(body, { auth = KEY, signal } = {}) {
@@ -106,14 +114,21 @@ test("a search the model asks for is Kiro's MCP web_search, its pages given back
   const m = await res.json()
   // the tool Kiro is offered: its own web search, not the hosted declaration
   expect(toolsSent(s).map((t) => t.toolSpecification.name)).toEqual(["web_search"])
-  expect(toolsSent(s)[0].toolSpecification.inputSchema.json).toMatchObject({ type: "object", required: ["query"] })
-  // the search, as Kiro's MCP takes it
+  expect(toolsSent(s)[0].toolSpecification).toEqual(CLI_SPEC)
+  // the search, as kiro-cli sends it: InvokeMCP at the runtime's root, the
+  // tools/call's arguments the query alone (no _meta)
   expect(s.mcp.length).toBe(1)
-  expect(s.mcp[0].url).toBe("https://q.us-east-1.amazonaws.com/mcp")
-  expect(s.mcp[0].body).toMatchObject({ jsonrpc: "2.0", method: "tools/call", params: { name: "web_search",
-    arguments: { query: "magpie release", _meta: { _isValid: true, _activePath: ["query"], _completedPaths: [["query"]] } } } })
-  expect(s.mcp[0].headers.get("authorization")).toBe("Bearer ksk_secretsecretsecret")
-  expect(s.mcp[0].headers.get("tokentype")).toBe("API_KEY")
+  const q = s.mcp[0]
+  expect(q.url).toBe("https://runtime.us-east-1.kiro.dev/")
+  expect(q.headers.get("content-type")).toBe("application/x-amz-json-1.0")
+  expect(q.headers.get("x-amz-target")).toBe("AmazonCodeWhispererStreamingService.InvokeMCP")
+  expect(q.body).toEqual({ jsonrpc: "2.0", id: "1", method: "tools/call", params: { name: "web_search", arguments: { query: "magpie release" } } })
+  expect(q.headers.get("authorization")).toBe("Bearer ksk_secretsecretsecret")
+  expect(q.headers.get("tokentype")).toBe("API_KEY")
+  // an API key names no profile, in the body (above) or a header, as kiro-cli;
+  // nothing of generateAssistantResponse's own
+  expect(q.headers.has("x-amzn-kiro-profile-arn")).toBe(false)
+  for (const h of ["x-amzn-kiro-agent-mode", "x-amzn-codewhisperer-optout", "accept"]) expect(q.headers.has(h)).toBe(false)
   // the next turn has the call and its result, snippets included
   const next = s.kiro[1].body.conversationState
   const call = next.history.at(-1).assistantResponseMessage
@@ -134,6 +149,37 @@ test("a search the model asks for is Kiro's MCP web_search, its pages given back
   expect(m.stop_reason).toBe("end_turn")
   expect(m.usage.server_tool_use).toEqual({ web_search_requests: 1 })
   expect(JSON.stringify(m)).not.toContain('"tool_use"')
+})
+
+// kiro-cli's agent adds __tool_use_purpose to its tools: the model may say
+// why it searches. That is kiro-cli's, not Anthropic's: the caller's
+// server_tool_use has the query alone, and only the query is searched for.
+test("a call's __tool_use_purpose is neither searched for nor shown, nor sent back", async () => {
+  const s = kiro({ turns: [[use("tu1", "web_search", { query: "bun 2", __tool_use_purpose: "check the release" })], [say("ok")]] })
+  const m = await (await ask({ tools: [SEARCH] })).json()
+  expect(s.mcp[0].body.params.arguments).toEqual({ query: "bun 2" })
+  expect(m.content[0]).toEqual({ type: "server_tool_use", id: expect.stringMatching(/^srvtoolu_/), name: "web_search", input: { query: "bun 2" } })
+  expect(s.kiro[1].body.conversationState.history.at(-1).assistantResponseMessage.toolUses[0].input).toEqual({ query: "bun 2" })
+  // streamed too
+  kiro({ turns: [[use("tu1", "web_search", { query: "bun 2", __tool_use_purpose: "why" })], [say("ok")]] })
+  const events = await sse(await ask({ tools: [SEARCH], stream: true }))
+  const input = events.filter((e) => e.type === "content_block_delta" && e.index === 0).map((e) => e.delta.partial_json).join("")
+  expect(JSON.parse(input)).toEqual({ query: "bun 2" })
+})
+
+// InvokeMCP's answer is { jsonrpc, id, result, error }; result is a document
+test("InvokeMCP's answer is read, its result an object or its JSON text; its error is a search error", async () => {
+  const text = JSON.stringify({ results: [hit(1)], totalResults: 1, query: "x", error: null })
+  for (const result of [{ content: [{ type: "text", text }] }, JSON.stringify({ content: [{ type: "text", text }] })]) {
+    kiro({ turns: [[use("a", "web_search", { query: "x" })], [say("ok")]], mcp: () => Response.json({ jsonrpc: "2.0", id: "1", result }) })
+    const m = await (await ask({ tools: [SEARCH] })).json()
+    expect(m.content.find((b) => b.type === "web_search_tool_result").content.map((r) => r.url)).toEqual(["https://example1.com/a"])
+  }
+  const s = kiro({ turns: [[use("a", "web_search", { query: "x" })], [say("ok")]],
+    mcp: () => Response.json({ jsonrpc: "2.0", id: "1", error: { code: -32602, message: "bad params" } }) })
+  const m = await (await ask({ tools: [SEARCH] })).json()
+  expect(m.content.find((b) => b.type === "web_search_tool_result").content).toEqual({ type: "web_search_tool_result_error", error_code: "unavailable" })
+  expect(s.kiro[1].body.conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults[0].content[0].text).toContain("bad params")
 })
 
 test("streamed, the same blocks come as Messages' events", async () => {
@@ -290,8 +336,15 @@ test("a token Kiro's search turns down is refreshed once and the search tried ag
   const m = await (await ask({ tools: [SEARCH] }, { auth: OAUTH })).json()
   expect(s.refreshes).toBe(1)
   expect(s.mcp.map((c) => c.headers.get("authorization"))).toEqual(["Bearer old", "Bearer new"])
-  // the profile's region is the search's too
-  expect(s.mcp[0].url).toBe("https://q.eu-central-1.amazonaws.com/mcp")
+  // the profile's region is the search's too. The profile is InvokeMCP's
+  // profileArn in the body (AWS JSON 1.0; without it Kiro answers 400
+  // "profileArn is required for this request"), and x-amzn-kiro-profile-arn
+  // too, as kiro-cli 2.35 sends it
+  expect(s.mcp.map((c) => c.url)).toEqual(["https://runtime.eu-central-1.kiro.dev/", "https://runtime.eu-central-1.kiro.dev/"])
+  expect(s.mcp.map((c) => c.headers.get("x-amzn-kiro-profile-arn"))).toEqual([PROFILE, PROFILE])
+  expect(s.mcp.map((c) => c.headers.has("tokentype"))).toEqual([false, false])
+  expect(s.mcp.map((c) => c.body)).toEqual([0, 1].map(() =>
+    ({ jsonrpc: "2.0", id: "1", method: "tools/call", profileArn: PROFILE, params: { name: "web_search", arguments: { query: "x" } } })))
   expect(Array.isArray(m.content.find((b) => b.type === "web_search_tool_result").content)).toBe(true)
   // an API key isn't refreshed: the search is unavailable, the answer goes on
   const s2 = kiro({ turns: [[use("a", "web_search", { query: "x" })], [say("ok")]], mcp: () => new Response("{}", { status: 403 }) })
@@ -410,6 +463,11 @@ test("a hosted web search other than web_search_20250305 named web_search is a 4
     expect(e.type).toBe("invalid_request_error")
     expect(e.message).toContain("web_search")
     expect(s.kiro.length + s.mcp.length).toBe(0)
+  }
+  // a newer version says how to have magpie search for it instead
+  for (const type of ["web_search_20260209", "web_search_preview"]) {
+    kiro({ turns: [] })
+    expect((await (await ask({ tools: [{ type, name: "web_search" }] })).json()).error.message).toContain("provider.kiro.searches to false")
   }
   // another hosted tool (not a web search) is still left out, as before
   const s = kiro({ turns: [[say("hi")]] })

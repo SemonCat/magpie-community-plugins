@@ -1066,16 +1066,14 @@ function kiroRequest(req, model, profile, budget) {
   return out
 }
 
-// clientHeaders are kiro-cli's headers on a call to Kiro's runtime: who is
-// calling, and as which client.
-function clientHeaders(a) {
+// sdkHeaders are the AWS SDK's headers on a call to Kiro's runtime, as
+// kiro-cli's client sends them: who is calling, and as which client.
+function sdkHeaders(a) {
   const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-${randomUUID().replaceAll("-", "")}`
   return {
     ...authHeaders(a),
-    "x-amzn-codewhisperer-optout": "true",
     "amz-sdk-invocation-id": randomUUID(),
     "amz-sdk-request": "attempt=1; max=1",
-    "x-amzn-kiro-agent-mode": "vibe",
     "x-amz-user-agent": ua,
     "User-Agent": ua,
   }
@@ -1084,7 +1082,8 @@ function clientHeaders(a) {
 function sendKiro(a, body, signal) {
   return fetch(runtime(a.region) + "/generateAssistantResponse", {
     method: "POST",
-    headers: { ...clientHeaders(a), "Content-Type": "application/json", Accept: "application/vnd.amazon.eventstream" },
+    headers: { ...sdkHeaders(a), "x-amzn-codewhisperer-optout": "true", "x-amzn-kiro-agent-mode": "vibe",
+      "Content-Type": "application/json", Accept: "application/vnd.amazon.eventstream" },
     body,
     signal,
   })
@@ -1514,28 +1513,35 @@ async function reply(it, model, stream, names = new Map()) {
 //
 // A request offering Anthropic's hosted web search ({type:
 // "web_search_20250305", name: "web_search"}) has it searched by Kiro's own
-// web search, the one kiro-cli's agent calls: an MCP tools/call of
-// web_search at q.<region>.amazonaws.com/mcp, with the account's token. The
-// model is offered the tool as one of its own; a call it makes to it is
-// searched here, the pages found go back to it as the call's result and it
-// is asked again, and the caller is answered with server_tool_use and
-// web_search_tool_result blocks and the answer, as Anthropic answers. The
-// caller's own tools are never run here.
+// web search, as kiro-cli (2.35) searches: its runtime's InvokeMCP
+// operation (AWS JSON 1.0, x-amz-target
+// AmazonCodeWhispererStreamingService.InvokeMCP, POSTed to the runtime's
+// root) carrying a JSON-RPC tools/call of web_search, with the account's
+// token and profile. The model is offered kiro-cli's web_search tool; a call
+// it makes to it is searched here, the pages found go back to it as the
+// call's result and it is asked again, and the caller is answered with
+// server_tool_use and web_search_tool_result blocks and the answer, as
+// Anthropic answers. The caller's own tools are never run here.
 
 const SEARCH_TYPE = "web_search_20250305"
 const SEARCH_NAME = "web_search"
-const mcpURL = (region) => `https://q.${region}.amazonaws.com/mcp`
+const MCP_TARGET = "AmazonCodeWhispererStreamingService.InvokeMCP"
 const SEARCH_USES = 10 // searches one request may make at most, max_uses or not
-const SEARCH_QUERY = 200 // characters: what Kiro's tools/list says its query takes
+const SEARCH_QUERY = 200 // characters: what kiro-cli's web_search says its query takes
 const SEARCH_TIMEOUT = 30_000
 const SEARCH_BODY = 1 << 20 // bytes of a search's answer read at most
 const SEARCH_RESULTS = 20
+// PURPOSE is what kiro-cli's agent adds to every tool it offers: the model
+// says why it calls it. It isn't searched for, nor shown to the caller.
+const PURPOSE = "__tool_use_purpose"
+// kiro-cli's web_search, as its agent offers it (2.35's own strings)
 const SEARCH_SPEC = {
   name: SEARCH_NAME,
-  description: "Search the web for current information. Returns pages with their title, URL, date and a snippet. " +
-    "Cite the pages you use by their URL.",
-  inputSchema: { json: { type: "object", properties: { query: { type: "string", maxLength: SEARCH_QUERY,
-    description: "What to search the web for" } }, required: ["query"] } },
+  description: "WebSearch looks up information that is outside the model's training data or cannot be reliably inferred from the current codebase/context.",
+  inputSchema: { json: { type: "object", properties: {
+    query: { type: "string", maxLength: SEARCH_QUERY, description: "Search query (max 200 chars) - use concise keywords, not full sentences" },
+    [PURPOSE]: { type: "string", description: "A brief explanation why you are making this tool use." },
+  }, required: ["query"] } },
 }
 
 // hostedSearch is the request's hosted web search, as it asks for it: the
@@ -1548,7 +1554,8 @@ function hostedSearch(req) {
   // dropped, so a search asked for isn't silently gone
   const searches = (req.tools ?? []).filter((t) => typeof t?.type === "string" && t.type.startsWith("web_search"))
   const odd = searches.find((t) => t.type !== SEARCH_TYPE || t.name !== SEARCH_NAME)
-  if (odd) return { error: `the hosted web search on Kiro is {type: "${SEARCH_TYPE}", name: "${SEARCH_NAME}"}, not {type: ${JSON.stringify(odd.type)}, name: ${JSON.stringify(odd.name ?? null)}}` }
+  if (odd) return { error: `the hosted web search on Kiro is {type: "${SEARCH_TYPE}", name: "${SEARCH_NAME}"}, not {type: ${JSON.stringify(odd.type)}, name: ${JSON.stringify(odd.name ?? null)}}; ` +
+    "set provider.kiro.searches to false to have magpie search for it" }
   if (searches.length > 1) return { error: "web_search is offered more than once" }
   const tool = searches[0]
   if (!tool) return null
@@ -1631,19 +1638,26 @@ async function bounded(res, limit) {
   return new TextDecoder().decode(Buffer.concat(parts))
 }
 
-// webSearch searches with Kiro's MCP web_search: { results } (Anthropic's
-// web_search_result blocks) and the text the model is given, or { code }
-// (a web_search_tool_result_error's error_code) and why, or { status: 403 }
-// for a token Kiro turned down. An abort is thrown.
+// webSearch searches with Kiro's web_search through InvokeMCP: { results }
+// (Anthropic's web_search_result blocks) and the text the model is given,
+// or { code } (a web_search_tool_result_error's error_code) and why, or
+// { status: 403 } for a token Kiro turned down. An abort is thrown. The
+// profile is InvokeMCPRequest's profileArn, which AWS JSON 1.0 sends in the
+// body: without it there Kiro answers 400 "profileArn is required for this
+// request", the x-amzn-kiro-profile-arn header (its httpHeader binding in
+// Kiro's REST model, sent too, as kiro-cli 2.35 sends it) notwithstanding.
+// An API key names no profile, as kiro-cli names none for one. The tool's
+// arguments are its query alone.
 async function webSearch(a, query, hosted, signal) {
   const timeout = AbortSignal.timeout(SEARCH_TIMEOUT)
   const both = signal ? AbortSignal.any([signal, timeout]) : timeout
-  const body = { jsonrpc: "2.0", id: randomUUID(), method: "tools/call",
-    params: { name: SEARCH_NAME, arguments: { query, _meta: { _isValid: true, _activePath: ["query"], _completedPaths: [["query"]] } } } }
+  const body = { jsonrpc: "2.0", id: "1", method: "tools/call", ...(a.profile ? { profileArn: a.profile } : {}),
+    params: { name: SEARCH_NAME, arguments: { query } } }
   let res, text
   try {
-    res = await fetch(mcpURL(a.region), { method: "POST", body: JSON.stringify(body), signal: both,
-      headers: { ...clientHeaders(a), "Content-Type": "application/json", Accept: "application/json, text/event-stream" } })
+    res = await fetch(runtime(a.region) + "/", { method: "POST", body: JSON.stringify(body), signal: both,
+      headers: { ...sdkHeaders(a), "amz-sdk-request": "attempt=1; max=3", "Content-Type": "application/x-amz-json-1.0",
+        "x-amz-target": MCP_TARGET, ...(a.profile ? { "x-amzn-kiro-profile-arn": a.profile } : {}) } })
     if (res.status === 403) {
       await res.body?.cancel().catch(() => {})
       return { status: 403 }
@@ -1658,25 +1672,25 @@ async function webSearch(a, query, hosted, signal) {
   return searchAnswer(text, hosted)
 }
 
-// searchAnswer reads a tools/call answer, as JSON or as server-sent events.
+// searchAnswer reads InvokeMCP's answer, { jsonrpc, id, result, error }: the
+// result is the tools/call's, its content a text block of the search's JSON.
 function searchAnswer(text, hosted) {
   let m
   try {
     m = JSON.parse(text)
-  } catch {
-    for (const line of text.split("\n"))
-      if (line.startsWith("data:"))
-        try {
-          const d = JSON.parse(line.slice(5))
-          if (d?.result || d?.error) m = d
-        } catch {}
-  }
+  } catch {}
   const bad = (why) => ({ code: "unavailable", why })
   if (!m || typeof m !== "object") return bad("the search's answer wasn't JSON")
   if (m.error) return bad("the search failed: " + secretless(m.error.message ?? m.error.code))
-  const content = Array.isArray(m.result?.content) ? m.result.content : []
+  // a document, which may come as its JSON text
+  let result = m.result
+  if (typeof result === "string")
+    try {
+      result = JSON.parse(result)
+    } catch {}
+  const content = Array.isArray(result?.content) ? result.content : []
   const out = content.find((c) => c?.type === "text" && typeof c.text === "string")
-  if (m.result?.isError) return bad("the search failed: " + secretless(out?.text))
+  if (result?.isError) return bad("the search failed: " + secretless(out?.text))
   let r
   try {
     r = JSON.parse(out?.text ?? "")
@@ -1839,6 +1853,10 @@ async function* searching(creds, auth, req, model, budget, signal, hosted, first
         const v = c.args ? JSON.parse(c.args) : {}
         if (v && typeof v === "object" && !Array.isArray(v)) input = v
       } catch {}
+      // why the model searched (PURPOSE) is kiro-cli's, not Anthropic's: the
+      // caller sees the query alone, and only it is searched for
+      const { [PURPOSE]: _why, ...shown } = input
+      input = shown
       yield { kind: "serverTool", id, name: SEARCH_NAME, input }
       const query = typeof input.query === "string" ? input.query.trim() : ""
       let found

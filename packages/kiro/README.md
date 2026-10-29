@@ -131,13 +131,26 @@ request:
 
 A request offering Anthropic's hosted web search,
 `{"type": "web_search_20250305", "name": "web_search", "max_uses": n}`, is
-searched with Kiro's own web search, the one kiro-cli's agent uses:
+searched with Kiro's own web search, sent as kiro-cli (2.35) sends it:
 
-- The model is offered a `web_search` tool taking a `query` (200 characters
-  at most). A call it makes to it is searched here, never passed to the
-  caller as a `tool_use`. The search is an MCP `tools/call` of `web_search`
-  at `q.<region>.amazonaws.com/mcp`, in the account's region, with its token
-  (an API key's too, as `tokentype: API_KEY`).
+- The model is offered kiro-cli's `web_search` tool as kiro-cli's agent
+  offers it: its description, a `query` (200 characters at most) and the
+  `__tool_use_purpose` kiro-cli adds to each tool. A call the model makes to
+  it is searched here, never passed to the caller as a `tool_use`. Its
+  `__tool_use_purpose` is kiro-cli's alone: it isn't searched for, and the
+  caller's `server_tool_use` has the `query` only.
+- The search is Kiro's runtime's `InvokeMCP` operation:
+  `POST runtime.<region>.kiro.dev/`, `Content-Type:
+  application/x-amz-json-1.0`, `x-amz-target:
+  AmazonCodeWhispererStreamingService.InvokeMCP`, in the account's region
+  with its token. Its body is a JSON-RPC `tools/call` of `web_search` with
+  `{query}` and nothing else, and the profile as `profileArn` beside it:
+  over AWS JSON 1.0 that member is sent in the body, and without it there
+  Kiro answers 400 `profileArn is required for this request`. It goes in
+  `x-amzn-kiro-profile-arn` too, as kiro-cli 2.35 sends it. An API key,
+  sent as `tokentype: API_KEY`, names no profile in either, as kiro-cli
+  names none for one. The answer is
+  `{jsonrpc, id, result, error}`, the result being the `tools/call`'s.
 - The pages found go back to the model as the call's result (title, URL,
   date, snippet), and it is asked again. The caller is answered as
   Anthropic answers: `server_tool_use` and `web_search_tool_result` blocks
@@ -168,12 +181,18 @@ searched with Kiro's own web search, the one kiro-cli's agent uses:
   `server_tool_use` and `web_search_tool_result` blocks, gives the model
   each search's call and result again. A tool of the caller's named
   `web_search` (no hosted `type`) stays the caller's.
-- Only `web_search_20250305` named `web_search` is searched. Any other tool
-  whose type begins `web_search` (a newer version such as
-  `web_search_20260209`, another name, the same tool twice) is a 400 before
-  Kiro is asked: with `searches: true` magpie hands every such tool to the
-  plugin rather than searching for it, so dropping it would leave the
-  search asked for undone. Other hosted tools are not sent, as before.
+- Other hosted tools are not sent, as before.
+
+### Supported scope
+
+Only `web_search_20250305` named `web_search` is searched (Claude Code sends
+it). Any other tool whose type begins `web_search` (a newer version such as
+`web_search_20260209`, another name, the same tool twice) is a 400 before
+Kiro is asked: with `searches: true` magpie hands every such tool to the
+plugin rather than searching for it, so dropping it would leave the search
+asked for undone. A client that sends a newer version needs
+`provider.kiro.searches: false`, so magpie's own search serves it as it did
+before; the 400 says so.
 
 The `config` hook says `searches: true` on the provider, so magpie passes a
 client's web search (Claude Code's WebSearch) on to Kiro as sent rather than
