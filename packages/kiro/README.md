@@ -105,6 +105,12 @@ request:
     that can't be read or brought under is replaced by a short note, so the
     conversation goes on (#428). Smaller images are sent as they are.
   - Tools the history used but the request doesn't offer are declared.
+  - A tool's input schema says `type: "object"` at its root, as Kiro
+    wants: one that says no type (or object-or-null) is sent saying so, and
+    an empty one as an object with no properties. Kiro answers 400
+    `REQUEST_BODY_INVALID` to either. Everything under the root (a union
+    there, properties, `$ref`s, `nullable`) is sent as given, and a root
+    that names another type is left alone.
 - It turns the AWS event stream Kiro answers with back into Messages'
   events (streamed) or one message. The reply includes text, thinking,
   tool calls and usage. When Kiro reports only how full the context is,

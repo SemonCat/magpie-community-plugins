@@ -845,6 +845,21 @@ function formatText(req) {
   return "Respond with a single JSON value and nothing else, matching this JSON schema:\n" + JSON.stringify(f.schema) + "."
 }
 
+// inputSchema is a tool's input schema as Kiro takes it: one whose root
+// says type "object". Kiro answers 400 REQUEST_BODY_INVALID to a root with
+// properties and no type (Haiku 5.5: the same schema with the type added
+// is called), and to {}. A tool's input is always an object, so a root
+// that says no type, or object-or-null, is said to be one; the rest of it
+// (a union at its root, its properties, $refs, nullable) is sent as given,
+// and a root that says another type is left as the caller said it. The
+// caller's schema isn't changed: the root is copied.
+function inputSchema(s) {
+  if (!s || typeof s !== "object" || Array.isArray(s) || !Object.keys(s).length) return { type: "object", properties: {} }
+  if (s.type === undefined) return { type: "object", ...s }
+  if (Array.isArray(s.type) && s.type.includes("object") && s.type.every((t) => t === "object" || t === "null")) return { ...s, type: "object" }
+  return s
+}
+
 // buildKiro is the body of a generateAssistantResponse call, as it is
 // before its images are fitted (kiroBody).
 function buildKiro(req, model, profile, budget) {
@@ -985,7 +1000,7 @@ function kiroRequest(req, model, profile, budget) {
     if (!t?.name || (t.type && t.type !== "custom" && !t.input_schema)) continue // server tools Kiro hasn't
     const name = toolName(t.name)
     offered.add(name)
-    tools.push({ toolSpecification: { name, description: t.description || t.name, inputSchema: { json: t.input_schema ?? EMPTY } } })
+    tools.push({ toolSpecification: { name, description: t.description || t.name, inputSchema: { json: inputSchema(t.input_schema) } } })
     if (t.cache_control) tools.push({ cachePoint: { type: "default" } })
   }
   for (const e of entries)
