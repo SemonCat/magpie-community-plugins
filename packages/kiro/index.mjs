@@ -1012,7 +1012,23 @@ function kiroRequest(req, model, profile, budget) {
   if (entries.length > 1) state.history = entries.slice(0, -1)
   const out = { conversationState: state, agentMode: "vibe" }
   if (profile) out.profileArn = profile
+  const config = inferenceConfig(req)
+  if (config) out.inferenceConfig = config
   return out
+}
+
+// inferenceConfig is what the caller set of max_tokens, temperature and
+// top_p, as Kiro takes them beside conversationState (Bedrock Converse's
+// InferenceConfiguration). A field not set, or out of Anthropic's bounds
+// (a whole number of tokens of 1 or more, a temperature and top_p of 0 to
+// 1), isn't sent: Kiro keeps its own.
+function inferenceConfig(req) {
+  const out = {}
+  const unit = (v) => typeof v === "number" && v >= 0 && v <= 1
+  if (Number.isSafeInteger(req.max_tokens) && req.max_tokens >= 1) out.maxTokens = req.max_tokens
+  if (unit(req.temperature)) out.temperature = req.temperature
+  if (unit(req.top_p)) out.topP = req.top_p
+  return Object.keys(out).length ? out : undefined
 }
 
 function sendKiro(a, body, signal) {

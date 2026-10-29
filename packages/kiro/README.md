@@ -102,6 +102,14 @@ request:
     that can't be read or brought under is replaced by a short note, so the
     conversation goes on (#428). Smaller images are sent as they are.
   - Tools the history used but the request doesn't offer are declared.
+  - The request's `max_tokens`, `temperature` and `top_p` go beside the
+    conversation as `inferenceConfig` (`maxTokens`, `temperature`,
+    `topP`), as other Kiro clients send them; kiro-cli sends none. Only
+    the fields the caller set go, and only within Anthropic's bounds (a
+    whole number of tokens from 1, a temperature and top_p from 0 to 1).
+    A request with none sends no `inferenceConfig`, and Kiro keeps its
+    own. Thinking leaves them as the caller set them. Whether Kiro holds a
+    reply to them hasn't been checked with a real account.
 - It turns the AWS event stream Kiro answers with back into Messages'
   events (streamed) or one message. The reply includes text, thinking,
   tool calls and usage. When Kiro reports only how full the context is,
