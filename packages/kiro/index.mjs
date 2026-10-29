@@ -1012,7 +1012,7 @@ function kiroRequest(req, model, profile, budget) {
   if (entries.length > 1) state.history = entries.slice(0, -1)
   const out = { conversationState: state, agentMode: "vibe" }
   if (profile) out.profileArn = profile
-  const config = inferenceConfig(req)
+  const config = inferenceConfig(req, model)
   if (config) out.inferenceConfig = config
   return out
 }
@@ -1021,13 +1021,16 @@ function kiroRequest(req, model, profile, budget) {
 // top_p, as Kiro takes them beside conversationState (Bedrock Converse's
 // InferenceConfiguration). A field not set, or out of Anthropic's bounds
 // (a whole number of tokens of 1 or more, a temperature and top_p of 0 to
-// 1), isn't sent: Kiro keeps its own.
-function inferenceConfig(req) {
+// 1), isn't sent: Kiro keeps its own. Claude Sonnet 4.5 and Haiku 4.5 take
+// temperature or top_p, not both (Bedrock's Claude request docs), so a
+// Claude model (or Auto, which may pick one) is sent the temperature alone
+// when both are set; top_p goes when the temperature isn't.
+function inferenceConfig(req, model) {
   const out = {}
   const unit = (v) => typeof v === "number" && v >= 0 && v <= 1
   if (Number.isSafeInteger(req.max_tokens) && req.max_tokens >= 1) out.maxTokens = req.max_tokens
   if (unit(req.temperature)) out.temperature = req.temperature
-  if (unit(req.top_p)) out.topP = req.top_p
+  if (unit(req.top_p) && !(out.temperature !== undefined && thinks(String(model).toLowerCase()))) out.topP = req.top_p
   return Object.keys(out).length ? out : undefined
 }
 
