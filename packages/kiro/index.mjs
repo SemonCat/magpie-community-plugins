@@ -1018,10 +1018,12 @@ function kiroRequest(req, model, profile, budget) {
 }
 
 // inferenceConfig is what the caller set of max_tokens, temperature and
-// top_p, as Kiro takes them beside conversationState (Bedrock Converse's
-// InferenceConfiguration). A field not set, or out of Anthropic's bounds
-// (a whole number of tokens of 1 or more, a temperature and top_p of 0 to
-// 1), isn't sent: Kiro keeps its own. Claude Sonnet 4.5 and Haiku 4.5 take
+// top_p, in the top-level inferenceConfig other Kiro clients send beside
+// conversationState (named as Bedrock Converse's InferenceConfiguration;
+// kiro-cli sends none). Kiro documents no such field, and whether it holds
+// a reply to these settings isn't established. A field not set, or out of
+// Anthropic's bounds (a whole number of tokens of 1 or more, a temperature
+// and top_p of 0 to 1), isn't sent. Claude Sonnet 4.5 and Haiku 4.5 take
 // temperature or top_p, not both (Bedrock's Claude request docs), so a
 // Claude model (or Auto, which may pick one) is sent the temperature alone
 // when both are set; top_p goes when the temperature isn't.

@@ -1,10 +1,11 @@
-// The caller's max_tokens, temperature and top_p reach Kiro. They were
-// dropped: the request kept the conversation, the agent mode and the profile
-// and nothing else, though the models declare temperature. Kiro's
-// generateAssistantResponse takes them beside conversationState as
-// inferenceConfig ({maxTokens, temperature, topP}, Bedrock Converse's
-// InferenceConfiguration), as other Kiro clients send them; kiro-cli 2.35
-// sends none. Only what the caller set goes, within Anthropic's bounds. Claude
+// The caller's max_tokens, temperature and top_p are kept in the request
+// sent to Kiro. They were dropped: the request kept the conversation, the
+// agent mode and the profile and nothing else, though the models declare
+// temperature. They now go beside conversationState as inferenceConfig
+// ({maxTokens, temperature, topP}), the field other Kiro clients send;
+// kiro-cli 2.35 sends none. These tests check the request, not whether Kiro
+// holds a reply to it. Only what the caller set goes, within Anthropic's
+// bounds. Claude
 // Sonnet 4.5 and Haiku 4.5 turn away temperature and top_p together
 // (Bedrock's Claude request docs), so a Claude model, or Auto, is sent the
 // temperature alone when both are set.

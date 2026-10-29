@@ -102,17 +102,19 @@ request:
     that can't be read or brought under is replaced by a short note, so the
     conversation goes on (#428). Smaller images are sent as they are.
   - Tools the history used but the request doesn't offer are declared.
-  - The request's `max_tokens`, `temperature` and `top_p` go beside the
-    conversation as `inferenceConfig` (`maxTokens`, `temperature`,
-    `topP`), as other Kiro clients send them; kiro-cli sends none. Only
-    the fields the caller set go, and only within Anthropic's bounds (a
-    whole number of tokens from 1, a temperature and top_p from 0 to 1).
-    A request with none sends no `inferenceConfig`, and Kiro keeps its
-    own. Claude Sonnet 4.5 and Haiku 4.5 take `temperature` or `top_p`,
+  - The request's `max_tokens`, `temperature` and `top_p` are kept in the
+    request sent, as `inferenceConfig` (`maxTokens`, `temperature`,
+    `topP`) beside the conversation: the field other Kiro clients send.
+    kiro-cli sends none, and Kiro documents no such field. Only the fields
+    the caller set go, and only within Anthropic's bounds (a whole number
+    of tokens from 1, a temperature and top_p from 0 to 1). A request with
+    none sends no `inferenceConfig`. Claude Sonnet 4.5 and Haiku 4.5 take `temperature` or `top_p`,
     not both, so a Claude model (or Auto) is sent the temperature alone
     when both are set, and `top_p` when the temperature isn't. Other models
     are sent both. Thinking leaves them as the caller set them. Whether
-    Kiro holds a reply to them hasn't been checked with a real account.
+    Kiro holds a reply to them is not established: in one streamed test,
+    a reply asked for 1 token came back whole, so `max_tokens` may be
+    ignored. The plugin doesn't cut replies itself.
 - It turns the AWS event stream Kiro answers with back into Messages'
   events (streamed) or one message. The reply includes text, thinking,
   tool calls and usage. When Kiro reports only how full the context is,
