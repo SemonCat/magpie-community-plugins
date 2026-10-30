@@ -1936,6 +1936,20 @@ async function signInPost(url, body) {
 
 const expiry = (s) => Date.now() + (s > 0 ? s : 3600) * 1000
 
+// what Kiro's page says of where to sign in at AWS, taken only in its shape:
+// the region goes into AWS's host names
+const AWS_REGION = /^[a-z]{2}(?:-[a-z]+)+-\d{1,2}$/
+// the ways Kiro's page comes back with a choice of
+const KIRO_WAYS = ["google", "github", "builderid", "awsidc", "internal", "external_idp"]
+function httpsURL(s) {
+  try {
+    const u = new URL(s)
+    return u.protocol === "https:" && !u.username && !u.password
+  } catch {
+    return false
+  }
+}
+
 // whoIs names a new sign-in with the email Kiro has for it, and its plan.
 async function whoIs(c) {
   try {
@@ -1960,8 +1974,21 @@ async function listen() {
   throw new Error("the ports Kiro's sign-in comes back to are all busy; close the Kiro IDE's sign-in and try again")
 }
 
+// signingIn ends the browser sign-in under way, if any, and frees its
+// port: magpie keeps one sign-in of a provider at a time, and one left
+// behind (a tab closed, a paste never made) kept its port till it timed
+// out, so a few of them left no port for the next
+let signingIn = null
+
 // browserSignIn is the IDE's: Kiro's sign-in page, back to a port here.
-async function browserSignIn() {
+async function browserSignIn(inputs = {}) {
+  const choice = inputs.loginMethod || "portal"
+  if (!["portal", "builderid", "enterprise"].includes(choice)) throw new Error("unknown Kiro sign-in method")
+  const issuer = choice === "enterprise" ? String(inputs.startUrl || "").trim() : BUILDER_ID_START
+  const region = String(inputs.region || "us-east-1").trim()
+  if (choice === "enterprise" && !httpsURL(issuer)) throw new Error("Enter the organization's HTTPS Start URL")
+  if (choice !== "portal" && !AWS_REGION.test(region)) throw new Error("Enter a valid AWS region")
+  signingIn?.()
   const { server, port } = await listen()
   const state = randomBytes(24).toString("base64url")
   const verifier = randomBytes(48).toString("base64url")
@@ -1977,7 +2004,39 @@ async function browserSignIn() {
     settle(result)
   }
 
+  // A sign-in comes back here once (Google, GitHub), or twice (Builder ID,
+  // Identity Center: Kiro's page, then AWS's). The browser may be on
+  // another computer (magpie on a server or in Docker): the address its
+  // tab ended on is pasted there, and magpie opens it here, on this port
+  // (magpie's pluginsignin_paste.go), following a 302 to AWS as the next
+  // page. So each stage answers only its own state, once, and a request
+  // that isn't this sign-in's is a 404, which magpie says is the wrong
+  // address at once instead of waiting.
+  let stage = "portal" // then "aws", then "over"
+  let busy = false // a code being traded: a second paste of it waits for the first
+  let onToAWS = "" // the page the portal stage sent the browser on to, said again to a repeat
+  let portalAsked = "" // what that stage was asked, so a repeat asking otherwise isn't taken
+  async function startAWS(opt, issuer, region) {
+    const reg = await signInPost(oidc(region) + "/client/register", { clientName: "Kiro IDE", clientType: "public", scopes: SCOPES,
+      grantTypes: ["authorization_code", "refresh_token"], redirectUris: ["http://127.0.0.1/oauth/callback"], issuerUrl: issuer })
+    if (stage === "over") throw new Error("this sign-in was cancelled")
+    if (!reg.clientId) throw new Error("AWS registered no client")
+    Object.assign(aws, { region, clientId: reg.clientId, clientSecret: reg.clientSecret,
+      provider: { builderid: "BuilderId", awsidc: "Enterprise", internal: "Internal" }[opt],
+      state: randomBytes(24).toString("base64url"), verifier: randomBytes(48).toString("base64url") })
+    const a = new URLSearchParams({ response_type: "code", client_id: aws.clientId, redirect_uri: awsRedirect, scopes: SCOPES.join(","),
+      state: aws.state, code_challenge: createHash("sha256").update(aws.verifier).digest("base64url"), code_challenge_method: "S256" })
+    onToAWS = `${oidc(region)}/authorize?${a}`
+    portalAsked = JSON.stringify([opt, issuer, region])
+    stage = "aws"
+    busy = false
+    return onToAWS
+  }
+
   server.on("request", async (req, res) => {
+    // each answer its own connection: none held open keeps the port once
+    // the sign-in is over
+    res.setHeader("Connection", "close")
     const url = new URL(req.url ?? "/", redirect)
     const html = (code, body) => {
       res.writeHead(code, { "Content-Type": "text/html; charset=utf-8" })
@@ -1985,57 +2044,88 @@ async function browserSignIn() {
     }
     if (url.pathname !== "/oauth/callback" && url.pathname !== "/signin/callback") return res.writeHead(404).end()
     const q = url.searchParams
-    if (!waiting) return html(200, page(false, "This sign-in is over", "Start it again."))
+    const over = () => html(404, page(false, "This sign-in is over", "Start it again."))
+    const notOurs = () => html(404, page(false, "This link isn't from this sign-in", "Paste the address of the tab this sign-in opened, or start it again."))
+    if (stage === "over") return over()
     const fail = (msg) => {
+      stage = "over"
       finish({ type: "failed", error: msg })
       html(200, page(false, "Sign-in didn't finish", msg))
     }
+    const got = q.get("state") ?? ""
+    const portal = got === state
+    const fromAWS = stage === "aws" && !!aws.state && got === aws.state
+    // a stale tab, another sign-in's, or a page that just sends a request
+    // here: it says nothing about this one, and can't end it
+    if (!portal && !fromAWS) return notOurs()
+    if (busy) return html(409, page(false, "Already finishing", "This sign-in is finishing with this address already."))
     if (q.get("error")) return fail(q.get("error_description") || q.get("error"))
     let c
     try {
-      if (aws.state && q.get("state") === aws.state) {
-        // back from AWS
+      if (fromAWS) {
+        // back from AWS, to the address it was sent with
+        if (url.pathname !== "/oauth/callback") return notOurs()
         if (!q.get("code")) return fail("AWS sent back no code")
+        busy = true
         const t = await signInPost(oidc(aws.region) + "/token", { clientId: aws.clientId, clientSecret: aws.clientSecret,
           grantType: "authorization_code", redirectUri: awsRedirect, code: q.get("code"), codeVerifier: aws.verifier })
         if (!t.accessToken) throw new Error("AWS sent back no token")
         c = { access: t.accessToken, refresh: t.refreshToken ?? "", expires: expiry(t.expiresIn), method: "idc", loginProvider: aws.provider,
           region: aws.region, clientId: aws.clientId, clientSecret: aws.clientSecret, profile: "", builderID: isBuilderID(aws.provider) }
-      } else if (q.get("state") !== state) {
-        // not ours: someone else's page, or a stale tab
-        return html(200, page(false, "This link isn't from this sign-in", "Start it again."))
       } else {
         const opt = q.get("login_option") ?? ""
+        const asked = JSON.stringify([opt, q.get("issuer_url"), q.get("idc_region")])
+        if (stage === "aws") {
+          // Kiro's page's address again (pasted twice, or reloaded): the
+          // same AWS page, not a second client and state, which would
+          // leave the first AWS tab's code refused
+          if (onToAWS && asked === portalAsked) {
+            res.writeHead(302, { Location: onToAWS })
+            return res.end()
+          }
+          // chosen again on Kiro's page (Back, then another way): that
+          // choice now, the AWS sign-in left behind dropped. Anything else
+          // with Kiro's page's state isn't a choice, and leaves AWS's going
+          if (!KIRO_WAYS.includes(opt)) return notOurs()
+          stage = "portal"
+          onToAWS = portalAsked = ""
+          for (const k of Object.keys(aws)) delete aws[k]
+        }
         if (opt === "google" || opt === "github") {
+          if (!q.get("code")) return fail("Kiro's page sent back no code")
+          busy = true
           const t = await signInPost(AUTH_SERVICE + "/oauth/token", { code: q.get("code"), code_verifier: verifier,
             redirect_uri: redirect + url.pathname + "?login_option=" + opt })
           if (!t.accessToken) throw new Error("Kiro sent back no token")
           c = { access: t.accessToken, refresh: t.refreshToken ?? "", expires: expiry(t.expiresIn), method: "social",
             loginProvider: opt === "google" ? "Google" : "Github", region: "us-east-1", profile: t.profileArn ?? "" }
         } else if (opt === "builderid" || opt === "awsidc" || opt === "internal") {
-          // on to AWS, with a client registered for this sign-in
+          // on to AWS, with a client registered for this sign-in. The region
+          // goes into AWS's host name, so it is only a region's shape
           const issuer = q.get("issuer_url")
           const region = q.get("idc_region")
           if (!issuer || !region) return fail("Kiro's page didn't say where to sign in at AWS")
-          const reg = await signInPost(oidc(region) + "/client/register", { clientName: "Kiro IDE", clientType: "public", scopes: SCOPES,
-            grantTypes: ["authorization_code", "refresh_token"], redirectUris: ["http://127.0.0.1/oauth/callback"], issuerUrl: issuer })
-          if (!reg.clientId) throw new Error("AWS registered no client")
-          Object.assign(aws, { region, clientId: reg.clientId, clientSecret: reg.clientSecret,
-            provider: { builderid: "BuilderId", awsidc: "Enterprise", internal: "Internal" }[opt],
-            state: randomBytes(24).toString("base64url"), verifier: randomBytes(48).toString("base64url") })
-          const a = new URLSearchParams({ response_type: "code", client_id: aws.clientId, redirect_uri: awsRedirect, scopes: SCOPES.join(","),
-            state: aws.state, code_challenge: createHash("sha256").update(aws.verifier).digest("base64url"), code_challenge_method: "S256" })
-          res.writeHead(302, { Location: `${oidc(region)}/authorize?${a}` })
+          if (!AWS_REGION.test(region)) return fail("Kiro's page named a region AWS doesn't have")
+          if (!httpsURL(issuer)) return fail("Kiro's page named an AWS sign-in that isn't an https address")
+          busy = true
+          await startAWS(opt, issuer, region)
+          res.writeHead(302, { Location: onToAWS })
           return res.end()
         } else if (opt === "external_idp") {
           return fail("A company's own identity provider can't be signed in to here yet; sign in with `kiro-cli login`, and use Kiro CLI's sign-in")
         } else return fail(`Kiro's page came back with a sign-in this plugin doesn't know (${JSON.stringify(opt)})`)
       }
     } catch (e) {
+      if (stage === "over") return over()
+      busy = false
       return fail(e.message)
     }
+    if (stage === "over") return over() // ended (a new sign-in, the time) while the code was traded
+    // still busy while it is named: a second paste is told it is finishing
     const who = await whoIs(c)
+    if (stage === "over") return over()
     const user = who.email ? nameOf(who.email, c.loginProvider) : "Kiro account"
+    stage = "over"
     finish({ type: "success", provider: ID, refresh: c.refresh, access: c.access, expires: c.expires, accountId: user,
       ...(uidOf(c.loginProvider) ? { uid: uidOf(c.loginProvider) } : {}),
       method: c.method, loginProvider: c.loginProvider, region: c.region, profileArn: who.profile,
@@ -2043,11 +2133,43 @@ async function browserSignIn() {
     html(200, page(true, "You're signed in", `${user} is signed in. You can close this tab.`))
   })
 
-  const timer = setTimeout(() => finish({ type: "failed", error: "the sign-in timed out" }), SIGN_IN_TIMEOUT)
+  const timer = setTimeout(() => {
+    stage = "over"
+    finish({ type: "failed", error: "the sign-in timed out" })
+  }, SIGN_IN_TIMEOUT)
+  const end = () => {
+    if (signingIn === superseded) signingIn = null
+    server.close()
+  }
+  // a new sign-in ends this one, or, over, frees its port at once
+  const superseded = () => {
+    stage = "over"
+    finish({ type: "failed", error: "another sign-in to Kiro was started" })
+    end()
+  }
+  signingIn?.() // one started while this one found its port
+  signingIn = superseded
   done.then(() => {
     clearTimeout(timer)
-    setTimeout(() => server.close(), 10_000).unref?.()
+    // a late address (pasted again, a tab reloaded) is told it is over a while
+    setTimeout(end, 10_000).unref?.()
   })
+  if (choice === "builderid" || choice === "enterprise") {
+    try {
+      const url = await startAWS(choice === "enterprise" ? "awsidc" : "builderid", issuer, region)
+      return {
+        url,
+        instructions: "Complete AWS sign-in. If magpie runs on another computer, paste the complete address of the final localhost page back here.",
+        method: "auto",
+        callback: () => done,
+      }
+    } catch (error) {
+      stage = "over"
+      finish({ type: "failed", error: error.message })
+      end()
+      throw error
+    }
+  }
   const challenge = createHash("sha256").update(verifier).digest("base64url")
   const q = new URLSearchParams({ state, code_challenge: challenge, code_challenge_method: "S256", redirect_uri: redirect, redirect_from: "KiroIDE" })
   return {
@@ -2138,7 +2260,19 @@ export async function KiroAuthPlugin({ client } = {}) {
         }
       },
       methods: [
-        { type: "oauth", label: "Kiro (Google, GitHub, AWS Builder ID, IAM Identity Center)", authorize: browserSignIn },
+        { type: "oauth", label: "Kiro (Google, GitHub, AWS Builder ID, IAM Identity Center)",
+          prompts: [{ type: "select", key: "loginMethod", message: "Choose a sign-in method", options: [
+            { label: "IAM Identity Center (organization Start URL)", value: "enterprise", hint: "Sign in to your organization with its AWS Start URL" },
+            { label: "AWS Builder ID", value: "builderid", hint: "Open AWS sign-in directly; one callback to paste on a remote server" },
+            { label: "Kiro sign-in page", value: "portal", hint: "Google, GitHub, IAM Identity Center or other Kiro sign-in methods" },
+          ] },
+          { type: "text", key: "startUrl", message: "Organization Start URL", placeholder: "https://d-xxxxxxxxxx.awsapps.com/start",
+            condition: (inputs) => inputs.loginMethod === "enterprise",
+            validate: (value) => httpsURL(String(value || "").trim()) ? undefined : "Enter an HTTPS Start URL" },
+          { type: "text", key: "region", message: "AWS region (blank uses us-east-1)", placeholder: "us-east-1",
+            condition: (inputs) => inputs.loginMethod === "enterprise",
+            validate: (value) => !value || AWS_REGION.test(value.trim()) ? undefined : "Enter a valid AWS region" },
+          ], authorize: browserSignIn },
         { type: "oauth", label: "Kiro CLI's or Kiro IDE's sign-in", authorize: ownSignIn },
         { type: "api", label: "Kiro API key (ksk_…)" },
       ],

@@ -6,6 +6,23 @@ Power) and makes its requests, in OpenCode and in magpie. Provider id:
 
 ## Signing in
 
+Choose a sign-in method before opening the browser:
+
+- **AWS Builder ID** opens AWS directly for a personal account.
+- **IAM Identity Center (organization Start URL)** asks for the organization's
+  HTTPS Start URL and AWS region (blank defaults to `us-east-1`), then opens
+  that organization's AWS sign-in directly. Use the region of the directory.
+- **Kiro sign-in page** retains the portal for Google, GitHub and other Kiro
+  sign-in methods. Callers without prompt inputs retain this behavior.
+
+The two direct AWS options skip the portal's first loopback callback. When
+Magpie runs remotely or in Docker, sign in and authorize, then paste the
+complete final `http://127.0.0.1:<port>/oauth/callback?...` address into Magpie's
+Callback URL field. The page need not load on the browser's computer. Local
+browsers that can reach the plugin's listener finish automatically. Direct
+AWS sign-in still uses authorization code + PKCE, not device authorization.
+
+
 - **Kiro (Google, GitHub, AWS Builder ID, IAM Identity Center)**: the Kiro
   IDE's own sign-in.
   - Kiro's page (`app.kiro.dev/signin`) sends the browser back to one of
